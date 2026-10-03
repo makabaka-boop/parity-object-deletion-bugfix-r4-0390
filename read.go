@@ -36,9 +36,24 @@ func (s *Store) Get(ctx context.Context, key string) (data []byte, gen uint64, r
 	if len(plan.bad) == 1 {
 		installed, ierr := s.commitRepair(ctx, plan)
 		repaired = installed
-		if ierr != nil && !errors.Is(ierr, ErrConflict) && !errors.Is(ierr, errDiskUnavailable) {
-			// The data is reconstructable even if it could not be
-			// written back; a stale-repair conflict is also benign here.
+		switch {
+		case ierr == nil || errors.Is(ierr, errDiskUnavailable):
+			// Installed (or the only bad disk is gone): the data below is
+			// reconstructed from verified survivors.
+		case errors.Is(ierr, ErrConflict):
+			// The object was deleted or recreated while this read staged
+			// its repair. Re-resolve under the same key lock and serve the
+			// current incarnation; never return the deleted bytes.
+			plan, err = s.planRepair(ctx, key)
+			if err != nil {
+				return nil, 0, nil, err
+			}
+			repaired = nil
+			if len(plan.bad) >= 2 {
+				return nil, plan.man.Gen, nil,
+					fmt.Errorf("get %q: %d shards bad: %w", key, len(plan.bad), ErrUnrecoverable)
+			}
+		default:
 			return nil, 0, nil, ierr
 		}
 	} else if len(plan.bad) >= 2 {
@@ -82,6 +97,11 @@ func (s *Store) Repair(ctx context.Context, key string) (gen uint64, repaired []
 		return plan.man.Gen, nil, nil
 	}
 	installed, err := s.commitRepair(ctx, plan)
+	if errors.Is(err, ErrConflict) {
+		// Deleted or recreated while the repair was staged: nothing was
+		// installed. Report the conflict rather than the stale gen.
+		return 0, installed, err
+	}
 	return plan.man.Gen, installed, err
 }
 
@@ -92,6 +112,11 @@ func (s *Store) planRepair(ctx context.Context, key string) (*repairPlan, error)
 	man, _, err := s.loadBestManifest(ctx, id, true)
 	if err != nil {
 		return nil, err
+	}
+	if man.Deleted {
+		// A tombstone is the current state: deleted content must never be
+		// served or repaired, even with surviving shard files.
+		return nil, fmt.Errorf("get %q deleted at gen %d: %w", key, man.Gen, ErrNotFound)
 	}
 	plan := &repairPlan{id: id, man: man}
 
@@ -214,15 +239,25 @@ func (s *Store) commitRepair(ctx context.Context, plan *repairPlan) ([]int, erro
 		}
 	}
 
-	// Generation guard: re-read under the same key lock. If the
-	// published generation moved, drop every staged replacement.
+	// Generation guard: re-read under the same key lock. The object may
+	// have been deleted (tombstone) or superseded — either by a strictly
+	// higher generation or by a same-numbered recreation that reused the
+	// generation after the manifest evidence was lost. Equality of the
+	// generation number alone is therefore not enough: the current
+	// manifest must still describe the exact shards this repair is about
+	// to write. Any mismatch drops every staged replacement, so an old
+	// repair can never land on a deleted or rebuilt object.
 	cur, _, err := s.loadBestManifest(ctx, plan.id, false)
 	if err != nil {
 		abortRepairItems(items)
 		return nil, err
 	}
-	if cur.Gen != plan.man.Gen {
+	if cur.Deleted || !sameShardSet(cur, plan.man) {
 		abortRepairItems(items)
+		if cur.Deleted {
+			return nil, fmt.Errorf("repair gen %d of deleted key: %w",
+				plan.man.Gen, ErrConflict)
+		}
 		return nil, fmt.Errorf("repair gen %d superseded by gen %d: %w",
 			plan.man.Gen, cur.Gen, ErrConflict)
 	}
@@ -233,6 +268,13 @@ func (s *Store) commitRepair(ctx context.Context, plan *repairPlan) ([]int, erro
 			abortRepairItems(items[i:])
 			return installed, err
 		}
+		// Another repair (or a write) may have landed a valid shard
+		// first; re-verify the target under the current manifest and skip
+		// it rather than overwrite good bytes with stale ones.
+		if b, ok := s.readShard(it.disk, cur); ok && b != nil {
+			removeBestEffort(it.path)
+			continue
+		}
 		if err := commitStaged(it.path, it.final); err != nil {
 			abortRepairItems(items[i+1:])
 			return installed, fmt.Errorf("install repair shard on disk %d: %w", it.disk, err)
@@ -240,6 +282,24 @@ func (s *Store) commitRepair(ctx context.Context, plan *repairPlan) ([]int, erro
 		installed = append(installed, it.disk)
 	}
 	return installed, nil
+}
+
+// sameShardSet reports whether two live manifests describe the identical
+// shard layout: same generation and, for every shard position, the same
+// role, size and digest. A tombstone compares unequal to anything.
+func sameShardSet(a, b *Manifest) bool {
+	if a == nil || b == nil || a.Deleted || b.Deleted {
+		return false
+	}
+	if a.Gen != b.Gen {
+		return false
+	}
+	for i := 0; i < NumShards; i++ {
+		if a.Shards[i] != b.Shards[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func abortRepairItems(items []repairStaged) {

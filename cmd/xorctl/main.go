@@ -2,8 +2,9 @@
 //
 // Usage:
 //
-//	xorctl -root DIR put    KEY FILE/STRING
+//	xorctl -root DIR put    KEY FILE/STRING [EXPECTGEN]
 //	xorctl -root DIR get    KEY
+//	xorctl -root DIR delete KEY EXPECTGEN
 //	xorctl -root DIR repair KEY
 //	xorctl -root DIR doctor       # run one background-repair pass
 //
@@ -73,7 +74,13 @@ func run(args []string) error {
 		if data, gen, _, gerr := s.Get(ctx, key); gerr == nil {
 			expect = gen
 			_ = data
-		} else if !errors.Is(gerr, xorstore.ErrNotFound) {
+		} else if errors.Is(gerr, xorstore.ErrNotFound) {
+			// Either never written (gen 0) or deleted: a deleted key
+			// must be recreated conditionally at its delete generation.
+			if g, aerr := s.Generation(ctx, key); aerr != nil && errors.Is(aerr, xorstore.ErrNotFound) {
+				expect = g
+			}
+		} else {
 			return gerr
 		}
 		if len(rest) > 3 {

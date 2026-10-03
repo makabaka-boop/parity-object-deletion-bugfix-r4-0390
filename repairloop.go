@@ -68,7 +68,11 @@ func (s *Store) RunRepairPass(ctx context.Context) error {
 		}
 		_, _, err = s.Repair(ctx, key)
 		if err != nil {
+			// Deleted keys (tombstones) and unrecoverable/corrupt objects
+			// are skipped: deletion must not be undone by a background
+			// scan, and damaged objects need operator attention.
 			if firstErr == nil &&
+				!isError(err, ErrNotFound) &&
 				!isError(err, ErrUnrecoverable) &&
 				!isError(err, ErrManifestCorrupt) {
 				firstErr = err

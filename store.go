@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 )
 
@@ -15,6 +16,12 @@ import (
 // hook boundary as if a crash had prevented further progress (the
 // partially staged files stay on disk until the next recovery).
 type Hooks struct {
+	// BeforeDeleteCommit runs after the delete condition (current
+	// generation == expectGen) has been checked and the tombstone manifest
+	// staged on every available disk, but before any tombstone copy is
+	// published. gen is the generation Delete will return. Returning an
+	// error aborts the delete; ErrSimulatedCrash keeps the staged files as
+	// a modelled crash (recovery sweeps them and the object stays live).
 	BeforeDeleteCommit func(key string, gen uint64) error
 	// BeforeManifestCommit runs after all three new shards have been
 	// staged and verified, before any of them (or the new manifest) is
@@ -115,6 +122,129 @@ func (s *Store) currentGen(ctx context.Context, key string) (*Manifest, error) {
 	return man, nil
 }
 
+// Generation returns the current generation of key, 0 if the key has no
+// manifest (never seen) and ErrNotFound if the key is currently deleted
+// (its best manifest is a tombstone). It lets a caller learn the
+// conditional generation for a Put after a Delete: recreating a deleted
+// key requires the delete generation returned by Delete, never zero.
+func (s *Store) Generation(ctx context.Context, key string) (uint64, error) {
+	if key == "" {
+		return 0, errors.New("xorstore: empty key")
+	}
+	kl := s.lockKey(key)
+	kl.Lock()
+	defer kl.Unlock()
+	cur, err := s.currentGen(ctx, key)
+	if err != nil {
+		return 0, err
+	}
+	if cur == nil {
+		return 0, nil
+	}
+	if cur.Deleted {
+		return cur.Gen, fmt.Errorf("generation %q deleted at gen %d: %w", key, cur.Gen, ErrNotFound)
+	}
+	return cur.Gen, nil
+}
+
+// anyPublishedShard reports whether any disk holds a published shard file
+// for id (generation-scoped name, any generation). It is used to detect
+// "generation evidence without a manifest" — the state left when every
+// manifest copy of a key has been lost. A first-time Put is refused in
+// that state rather than reusing an old generation.
+func (s *Store) anyPublishedShard(id string) bool {
+	for _, d := range s.dirs {
+		if !diskExists(d) {
+			continue
+		}
+		entries, err := os.ReadDir(d)
+		if err != nil {
+			continue
+		}
+		prefix := id + "-gen"
+		for _, e := range entries {
+			name := e.Name()
+			if e.IsDir() || !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, ".shard") {
+				continue
+			}
+			_, fileID, ok := parseShardName(name)
+			if ok && fileID == id {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// publishManifest atomically publishes man to every present disk: all
+// copies are first staged and verified (an error before the first rename
+// leaves every existing manifest untouched), then renamed one by one.
+// After the first rename the manifest is readable and remaining copies
+// are healed. beforeCommit, when non-nil, runs after every copy is staged
+// but before any rename; an error from it (other than ErrSimulatedCrash)
+// aborts the staged copies and nothing is published. It returns the
+// number of disks on which publication was attempted (present disks).
+func (s *Store) publishManifest(ctx context.Context, id string, man *Manifest,
+	beforeCommit func() error) (int, error) {
+	raw, err := json.MarshalIndent(man, "", "  ")
+	if err != nil {
+		return 0, err
+	}
+	staged := [NumShards]string{}
+	present := 0
+	for d := 0; d < NumShards; d++ {
+		if !diskExists(s.dirs[d]) {
+			continue
+		}
+		path, err := stageFile(s.dirs[d], id, "manifest", raw)
+		if err != nil {
+			s.abortStaged(staged[:])
+			return present, fmt.Errorf("stage manifest: %w", err)
+		}
+		staged[d] = path
+		present++
+	}
+	if present == 0 {
+		return 0, errors.New("xorstore: no disk available")
+	}
+
+	if beforeCommit != nil {
+		if err := beforeCommit(); err != nil {
+			if !errors.Is(err, ErrSimulatedCrash) {
+				s.abortStaged(staged[:])
+			}
+			return present, err
+		}
+	}
+
+	published := 0
+	var publishErr error
+	for d := 0; d < NumShards; d++ {
+		if staged[d] == "" {
+			continue
+		}
+		if err := commitStaged(staged[d], manifestPath(s.dirs[d], id)); err != nil {
+			publishErr = err
+			break
+		}
+		published++
+	}
+	if publishErr == nil {
+		return present, nil
+	}
+	if published == 0 {
+		s.abortStaged(staged[:])
+		return present, fmt.Errorf("publish manifest: %w", publishErr)
+	}
+	// At least one copy is live, so the new manifest is the readable one.
+	// Heal the remaining copies before reporting.
+	if _, _, herr := s.loadBestManifest(ctx, id, true); herr != nil {
+		return present, fmt.Errorf("manifest partially published (%d disks), heal failed: %w",
+			published, herr)
+	}
+	return present, nil
+}
+
 // loadBestManifest reads all manifest copies, validates them and returns
 // the one with the highest generation. When heal is true, disks with no
 // manifest or with an older/garbled copy are refreshed. The returned
@@ -213,6 +343,19 @@ func validateManifest(m *Manifest) error {
 	if m.Length < 0 {
 		return errors.New("negative length")
 	}
+	if m.Deleted {
+		// A tombstone references no shards. It must not masquerade as a
+		// live manifest: the shard table is required to be empty.
+		for i := 0; i < NumShards; i++ {
+			if m.Shards[i] != (ShardInfo{}) {
+				return errors.New("tombstone carries shard metadata")
+			}
+		}
+		if m.Length != 0 {
+			return errors.New("tombstone carries length")
+		}
+		return nil
+	}
 	roles := map[string]int{}
 	for i := 0; i < NumShards; i++ {
 		sh := m.Shards[i]
@@ -225,4 +368,15 @@ func validateManifest(m *Manifest) error {
 		return errors.New("bad shard roles")
 	}
 	return nil
+}
+
+// buildTombstone assembles the delete marker for key at deleteGen (the
+// generation Delete returns: the deleted content's generation plus one).
+func buildTombstone(key string, deleteGen uint64) *Manifest {
+	return &Manifest{
+		Deleted: true,
+		Schema:  1,
+		Key:     key,
+		Gen:     deleteGen,
+	}
 }

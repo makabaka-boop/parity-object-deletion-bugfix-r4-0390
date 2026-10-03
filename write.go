@@ -2,7 +2,6 @@ package xorstore
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 )
@@ -39,6 +38,18 @@ func (s *Store) Put(ctx context.Context, key string, data []byte, expectGen uint
 	if expectGen != curGen {
 		return curGen, fmt.Errorf("put %q expected gen %d, current %d: %w",
 			key, expectGen, curGen, ErrConflict)
+	}
+	if cur == nil {
+		// No manifest names a current generation. If published shard
+		// files of this key still exist, every manifest copy of a prior
+		// incarnation has been lost (e.g. delete evidence vanished).
+		// Treating this as a first write would publish gen 1 again, so
+		// new content could overwrite or be confused with the old
+		// incarnation. Restart recovery GCs the orphans; until then the
+		// recreation must be failed rather than silently reuse the gen.
+		if s.anyPublishedShard(keyID(key)) {
+			return 0, fmt.Errorf("put %q: %w", key, ErrGenerationAmbiguous)
+		}
 	}
 	newGen := curGen + 1
 	id := keyID(key)
@@ -103,48 +114,28 @@ func (s *Store) Put(ctx context.Context, key string, data []byte, expectGen uint
 		committed++
 	}
 
-	// 4. Build and publish the new manifest. First stage all copies so
-	//    a failure before renaming cannot corrupt any existing manifest;
-	//    then rename one by one. After the first rename the new
-	//    generation is readable and the remaining renames are retried
-	//    via manifest healing on future operations.
+	// 4. Publish the new manifest to every disk. publishManifest stages
+	//    all copies before renaming any of them, so a failure before the
+	//    first rename cannot alter an existing manifest; after the first
+	//    rename the new generation is readable and remaining copies are
+	//    retried via manifest healing on future operations.
 	man := s.buildManifest(key, newGen, len(data), raw[:], roles[:])
-	manRaw, err := json.MarshalIndent(man, "", "  ")
-	if err != nil {
-		return 0, err
+	present, perr := s.publishManifest(ctx, id, man, nil)
+	if perr != nil {
+		if present > 0 {
+			// The generation is live on some disk; report success of the
+			// data but surface the partial durability.
+			return newGen, perr
+		}
+		// No manifest made it: the new shards are unreferenced. Leave
+		// them for recovery GC rather than risking a partial rollback
+		// under error; nothing references them yet.
+		return 0, perr
 	}
-	manStaged := [NumShards]string{}
-	for d := 0; d < NumShards; d++ {
-		path, err := stageFile(s.dirs[d], id, "manifest", manRaw)
-		if err != nil {
-			s.abortStaged(manStaged[:])
-			return 0, fmt.Errorf("stage manifest: %w", err)
-		}
-		manStaged[d] = path
-	}
-	published := 0
-	var publishErr error
-	for d := 0; d < NumShards; d++ {
-		if err := commitStaged(manStaged[d], manifestPath(s.dirs[d], id)); err != nil {
-			publishErr = err
-			break
-		}
-		published++
-	}
-	if publishErr != nil {
-		s.abortStaged(manStaged[published:])
-		if published == 0 {
-			// No manifest made it: the new shards are unreferenced.
-			// Leave them for recovery GC rather than risking a partial
-			// rollback under error; nothing references them yet.
-			return 0, fmt.Errorf("publish manifest: %w", publishErr)
-		}
-		// At least one copy is published, so the generation is live.
-		// Try to heal the remaining copies before reporting.
-		if _, _, err := s.loadBestManifest(ctx, id, true); err != nil {
-			return newGen, fmt.Errorf("manifest partially published (%d/%d disks), heal failed: %w",
-				published, NumShards, err)
-		}
+	if present < NumShards {
+		// Manifest is live but not every disk was present; the gen-scoped
+		// shards stay (recovery heals when the disk returns).
+		return newGen, nil
 	}
 	return newGen, nil
 }

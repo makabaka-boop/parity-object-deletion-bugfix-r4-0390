@@ -5,11 +5,13 @@
 // A manifest per object records the original length, per-shard SHA-256
 // digests and the object's generation. New generations are published with
 // a conditional (expected-generation) update: all three new shards must be
-// staged and verified before the new manifest becomes readable. Reads
-// reconstruct from, and repair, a single bad/missing shard; two bad shards
-// are reported unrecoverable. Replays of older-generation repairs can
-// never overwrite newer generations because shards and manifests are
-// generation scoped and installation is re-checked under the key lock.
+// staged and verified before the new manifest becomes readable. Deletion
+// is published the same way, as a higher-generation tombstone manifest.
+// Reads reconstruct from, and repair, a single bad/missing shard; two bad
+// shards are reported unrecoverable. Replays of older-generation repairs
+// can never overwrite newer generations or deleted objects because shards
+// and manifests are generation scoped and installation is re-checked
+// (generation plus shard digests) under the key lock.
 package xorstore
 
 import (
@@ -17,6 +19,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"os"
 )
 
@@ -41,6 +44,14 @@ var (
 	ErrUnrecoverable = errors.New("xorstore: object unrecoverable")
 	// ErrManifestCorrupt means no structurally valid manifest exists.
 	ErrManifestCorrupt = errors.New("xorstore: manifest corrupt")
+	// ErrGenerationAmbiguous means no manifest determines the object's
+	// current generation while shard files of an older incarnation are
+	// still present on disk (for example every manifest copy was deleted
+	// out of band). A first-time Put (expectGen 0) is refused in that
+	// state because it could reuse an old generation and make new content
+	// indistinguishable from the old one; restart recovery clears the
+	// orphan shards, after which the Put is accepted.
+	ErrGenerationAmbiguous = fmt.Errorf("xorstore: generation evidence insufficient: %w", ErrManifestCorrupt)
 	// ErrSimulatedCrash is returned by test hooks to model a process
 	// crash at a hook boundary: the operation stops immediately, leaving
 	// staged files on disk for restart recovery to sweep.
@@ -50,23 +61,33 @@ var (
 // ShardInfo is one shard entry of a manifest.
 type ShardInfo struct {
 	// Role is "a", "b" or "p".
-	Role string `json:"role"`
+	Role string `json:"role,omitempty"`
 	// Size is the on-disk shard length in bytes (both data shards and
 	// parity have identical size).
-	Size int `json:"size"`
+	Size int `json:"size,omitempty"`
 	// Digest is the lowercase hex SHA-256 of the shard bytes.
-	Digest string `json:"digest"`
+	Digest string `json:"digest,omitempty"`
 }
 
 // Manifest is the per-object metadata published atomically.
 type Manifest struct {
+	// Deleted marks a tombstone manifest: it records that the object was
+	// conditionally deleted at Gen. A tombstone is the authoritative
+	// "current generation" for its key: reads and repairs report
+	// ErrNotFound, the background scan skips the key, and a same-name
+	// recreation must conditional-write at Gen (which publishes Gen+1
+	// rather than reusing any older generation). Tombstones carry no
+	// shard metadata; all shard generations below Gen are garbage.
 	Deleted bool   `json:"deleted,omitempty"`
 	Schema  int    `json:"schema"`
 	Key     string `json:"key"`
 	// Gen is the monotonically increasing object generation, starting at 1.
+	// For a tombstone it is the delete generation (the deleted content's
+	// generation plus one).
 	Gen uint64 `json:"gen"`
 	// Length is the original object length; for odd lengths the second
 	// data shard carries one zero padding byte that is not part of it.
+	// It is zero (and unused) on a tombstone.
 	Length int                  `json:"length"`
 	Shards [NumShards]ShardInfo `json:"shards"`
 }
