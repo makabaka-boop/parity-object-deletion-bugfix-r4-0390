@@ -100,19 +100,53 @@ func (s *Store) lockKey(key string) *keyLock {
 	return kl
 }
 
-// currentGen returns the generation of the best readable manifest (0 if
+// currentGen returns the generation of the best readable manifest (nil if
 // none) and ensures all disks that can hold a copy do hold the best copy.
 // Caller must hold the key lock.
+//
+// When no manifest is readable but published shard files for the id exist
+// on disk, the object has a partially erased history whose highest
+// generation cannot be determined; the error wraps ErrGenerationEvidence
+// so callers never mistake that for a never-written object and reuse a
+// stale generation.
 func (s *Store) currentGen(ctx context.Context, key string) (*Manifest, error) {
 	id := keyID(key)
 	man, _, err := s.loadBestManifest(ctx, id, true)
 	if errors.Is(err, ErrNotFound) {
+		if s.publishedShardEvidence(id) {
+			return nil, fmt.Errorf("key %q: shards present without manifest: %w",
+				key, ErrGenerationEvidence)
+		}
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
 	return man, nil
+}
+
+// publishedShardEvidence reports whether any disk carries a
+// generation-scoped published shard file for id. Stage directories are
+// not consulted (their files are unpublished and swept on restart).
+func (s *Store) publishedShardEvidence(id string) bool {
+	for _, d := range s.dirs {
+		if !diskExists(d) {
+			continue
+		}
+		entries, err := os.ReadDir(d)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			if _, _, ok := parseShardName(id, e.Name()); ok {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // loadBestManifest reads all manifest copies, validates them and returns
@@ -200,6 +234,8 @@ func (s *Store) loadBestManifest(ctx context.Context, id string, heal bool) (*Ma
 }
 
 // validateManifest checks the structural invariants a manifest must meet.
+// A deletion record ("tombstone") carries only the key and the generation
+// past which the object must stay unreadable; it has no shards.
 func validateManifest(m *Manifest) error {
 	if m.Schema != 1 {
 		return errors.New("bad schema")
@@ -212,6 +248,17 @@ func validateManifest(m *Manifest) error {
 	}
 	if m.Length < 0 {
 		return errors.New("negative length")
+	}
+	if m.Deleted {
+		if m.Length != 0 {
+			return errors.New("tombstone with nonzero length")
+		}
+		for i := 0; i < NumShards; i++ {
+			if m.Shards[i] != (ShardInfo{}) {
+				return errors.New("tombstone with shard metadata")
+			}
+		}
+		return nil
 	}
 	roles := map[string]int{}
 	for i := 0; i < NumShards; i++ {

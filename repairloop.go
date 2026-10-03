@@ -70,7 +70,13 @@ func (s *Store) RunRepairPass(ctx context.Context) error {
 		if err != nil {
 			if firstErr == nil &&
 				!isError(err, ErrUnrecoverable) &&
-				!isError(err, ErrManifestCorrupt) {
+				!isError(err, ErrManifestCorrupt) &&
+				!isError(err, ErrNotFound) &&
+				!isError(err, ErrConflict) {
+				// NotFound: the object was deleted (or its generation
+				// advanced past the repair's plan while the pass ran).
+				// Conflict: a stale repair lost the race to a newer
+				// write/delete. Neither needs operator attention.
 				firstErr = err
 			}
 		}

@@ -50,6 +50,9 @@ func (s *Store) Put(ctx context.Context, key string, data []byte, expectGen uint
 
 	staged := [NumShards]string{}
 	for i := 0; i < NumShards; i++ {
+		if !diskExists(s.dirs[i]) {
+			continue // disk offline: its copy is rebuilt when it returns
+		}
 		path, err := stageFile(s.dirs[i], id, fmt.Sprintf("gen%d-%s", newGen, roles[i]), raw[i])
 		if err != nil {
 			s.abortStaged(staged[:])
@@ -61,6 +64,9 @@ func (s *Store) Put(ctx context.Context, key string, data []byte, expectGen uint
 	// 2. Read every staged shard back and verify it against the bytes
 	//    we intended to persist.
 	for i := 0; i < NumShards; i++ {
+		if staged[i] == "" {
+			continue // offline disk: nothing staged to verify
+		}
 		got, err := readStaged(staged[i])
 		if err != nil {
 			s.abortStaged(staged[:])
@@ -87,66 +93,108 @@ func (s *Store) Put(ctx context.Context, key string, data []byte, expectGen uint
 	// 3. Publish the three shards under generation-scoped names.
 	//    Nothing reads these until the manifest references gen N.
 	final := [NumShards]string{}
-	committed := 0
+	publishedPaths := []string{}
 	for i := 0; i < NumShards; i++ {
+		if staged[i] == "" {
+			continue // disk was offline: no copy to publish
+		}
 		final[i] = shardPath(s.dirs[i], id, newGen, roles[i])
 		if err := commitStaged(staged[i], final[i]); err != nil {
 			// Roll back the shards that were already published so the
 			// new generation cannot half-appear; the old generation is
 			// untouched (shards are gen-scoped).
-			for j := 0; j < committed; j++ {
-				removeBestEffort(final[j])
+			removeBestEffort(publishedPaths...)
+			for j := i + 1; j < NumShards; j++ {
+				removeBestEffort(staged[j])
 			}
-			removeBestEffort(staged[i+1:]...)
 			return 0, fmt.Errorf("publish shard %s: %w", roles[i], err)
 		}
-		committed++
+		publishedPaths = append(publishedPaths, final[i])
 	}
 
-	// 4. Build and publish the new manifest. First stage all copies so
-	//    a failure before renaming cannot corrupt any existing manifest;
-	//    then rename one by one. After the first rename the new
-	//    generation is readable and the remaining renames are retried
-	//    via manifest healing on future operations.
+	// 4. Publish the new manifest (all copies are staged first so a
+	//    failure before renaming cannot corrupt any existing manifest).
+	//    After the first rename the new generation is readable and the
+	//    remaining copies are retried via manifest healing on future
+	//    operations. If not even one rename lands, roll back the shards
+	//    just published so the failed operation leaves no half-finished,
+	//    unreferenced generation on disk.
 	man := s.buildManifest(key, newGen, len(data), raw[:], roles[:])
+	published, err := s.publishManifest(ctx, man)
+	if err != nil {
+		if published == 0 {
+			for i := 0; i < NumShards; i++ {
+				removeBestEffort(final[i])
+			}
+		}
+		return 0, err
+	}
+	return newGen, nil
+}
+
+// publishManifest marshals man, stages a copy on every present disk and
+// renames the copies into place one by one. Copies that fail to stage are
+// skipped and healed after the first rename. It returns the number of
+// copies that were renamed. A non-nil error means:
+//
+//   - no copy could be staged/renamed (published == 0): the generation is
+//     not live and the caller must roll back its shards;
+//   - some copies are live but healing the rest failed: the generation is
+//     readable on at least one disk already.
+func (s *Store) publishManifest(ctx context.Context, man *Manifest) (int, error) {
+	id := keyID(man.Key)
 	manRaw, err := json.MarshalIndent(man, "", "  ")
 	if err != nil {
 		return 0, err
 	}
 	manStaged := [NumShards]string{}
 	for d := 0; d < NumShards; d++ {
+		if !diskExists(s.dirs[d]) {
+			continue // disk removed: no copy to publish there
+		}
 		path, err := stageFile(s.dirs[d], id, "manifest", manRaw)
 		if err != nil {
-			s.abortStaged(manStaged[:])
-			return 0, fmt.Errorf("stage manifest: %w", err)
+			continue // healed later once the generation is live
 		}
 		manStaged[d] = path
 	}
 	published := 0
 	var publishErr error
 	for d := 0; d < NumShards; d++ {
+		if manStaged[d] == "" {
+			continue
+		}
 		if err := commitStaged(manStaged[d], manifestPath(s.dirs[d], id)); err != nil {
 			publishErr = err
 			break
 		}
 		published++
 	}
+	s.abortStaged(manStaged[:])
+	if published == 0 {
+		return 0, fmt.Errorf("publish manifest: %w",
+			firstErr(publishErr, errNoDiskAvailable))
+	}
 	if publishErr != nil {
-		s.abortStaged(manStaged[published:])
-		if published == 0 {
-			// No manifest made it: the new shards are unreferenced.
-			// Leave them for recovery GC rather than risking a partial
-			// rollback under error; nothing references them yet.
-			return 0, fmt.Errorf("publish manifest: %w", publishErr)
-		}
 		// At least one copy is published, so the generation is live.
 		// Try to heal the remaining copies before reporting.
 		if _, _, err := s.loadBestManifest(ctx, id, true); err != nil {
-			return newGen, fmt.Errorf("manifest partially published (%d/%d disks), heal failed: %w",
-				published, NumShards, err)
+			return published, fmt.Errorf("manifest partially published, heal failed: %w", err)
 		}
 	}
-	return newGen, nil
+	return published, nil
+}
+
+// errNoDiskAvailable marks that no present disk accepted a manifest
+// staging file.
+var errNoDiskAvailable = errors.New("xorstore: no disk available for manifest publish")
+
+// firstErr returns err if non-nil, otherwise fallback.
+func firstErr(err, fallback error) error {
+	if err != nil {
+		return err
+	}
+	return fallback
 }
 
 // abortStaged removes any non-empty staged paths.

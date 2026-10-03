@@ -41,6 +41,13 @@ var (
 	ErrUnrecoverable = errors.New("xorstore: object unrecoverable")
 	// ErrManifestCorrupt means no structurally valid manifest exists.
 	ErrManifestCorrupt = errors.New("xorstore: manifest corrupt")
+	// ErrGenerationEvidence means no manifest is readable for the key but
+	// published shard files prove that a generation once existed (for
+	// example leftovers of an externally removed object). A first write
+	// (expectGen == 0) is refused rather than reusing the old generation,
+	// which would make old and new content indistinguishable. Restart
+	// recovery clears the unreferenced shards when it is safe to do so.
+	ErrGenerationEvidence = errors.New("xorstore: insufficient generation evidence")
 	// ErrSimulatedCrash is returned by test hooks to model a process
 	// crash at a hook boundary: the operation stops immediately, leaving
 	// staged files on disk for restart recovery to sweep.

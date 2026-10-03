@@ -11,11 +11,12 @@ import (
 // shard bytes that verified and the indexes of bad/missing shards plus
 // reconstructed replacement bytes for them.
 type repairPlan struct {
-	id   string
-	man  *Manifest
-	good [NumShards][]byte
-	bad  []int
-	repl [NumShards][]byte // reconstructed bytes for bad shards
+	id        string
+	man       *Manifest
+	tombstone bool
+	good      [NumShards][]byte
+	bad       []int
+	repl      [NumShards][]byte // reconstructed bytes for bad shards
 }
 
 // Get returns the object's data, its generation and the indexes of any
@@ -32,6 +33,10 @@ func (s *Store) Get(ctx context.Context, key string) (data []byte, gen uint64, r
 	plan, err := s.planRepair(ctx, key)
 	if err != nil {
 		return nil, 0, nil, err
+	}
+	if plan.tombstone {
+		return nil, plan.man.Gen, nil,
+			fmt.Errorf("get %q: deleted at gen %d: %w", key, plan.man.Gen, ErrNotFound)
 	}
 	if len(plan.bad) == 1 {
 		installed, ierr := s.commitRepair(ctx, plan)
@@ -74,6 +79,12 @@ func (s *Store) Repair(ctx context.Context, key string) (gen uint64, repaired []
 	if err != nil {
 		return 0, nil, err
 	}
+	if plan.tombstone {
+		// A deleted object offers nothing to repair and must not serve
+		// data even when its old shards are still on disk.
+		return plan.man.Gen, nil,
+			fmt.Errorf("repair %q: deleted at gen %d: %w", key, plan.man.Gen, ErrNotFound)
+	}
 	if len(plan.bad) >= 2 {
 		return plan.man.Gen, nil,
 			fmt.Errorf("repair %q: %d shards bad: %w", key, len(plan.bad), ErrUnrecoverable)
@@ -94,6 +105,10 @@ func (s *Store) planRepair(ctx context.Context, key string) (*repairPlan, error)
 		return nil, err
 	}
 	plan := &repairPlan{id: id, man: man}
+	if man.Deleted {
+		plan.tombstone = true
+		return plan, nil
+	}
 
 	for i := 0; i < NumShards; i++ {
 		b, ok := s.readShard(i, man)
@@ -215,16 +230,18 @@ func (s *Store) commitRepair(ctx context.Context, plan *repairPlan) ([]int, erro
 	}
 
 	// Generation guard: re-read under the same key lock. If the
-	// published generation moved, drop every staged replacement.
+	// published generation moved (an update or a delete) drop every
+	// staged replacement, so an old-generation repair can neither
+	// clobber a newer generation nor resurrect a deleted object.
 	cur, _, err := s.loadBestManifest(ctx, plan.id, false)
 	if err != nil {
 		abortRepairItems(items)
 		return nil, err
 	}
-	if cur.Gen != plan.man.Gen {
+	if cur.Deleted || cur.Gen != plan.man.Gen {
 		abortRepairItems(items)
-		return nil, fmt.Errorf("repair gen %d superseded by gen %d: %w",
-			plan.man.Gen, cur.Gen, ErrConflict)
+		return nil, fmt.Errorf("repair gen %d superseded (current gen %d, deleted=%v): %w",
+			plan.man.Gen, cur.Gen, cur.Deleted, ErrConflict)
 	}
 
 	installed := make([]int, 0, len(items))

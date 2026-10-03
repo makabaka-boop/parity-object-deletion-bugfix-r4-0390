@@ -2,10 +2,16 @@
 //
 // Usage:
 //
-//	xorctl -root DIR put    KEY FILE/STRING
+//	xorctl -root DIR put    KEY FILE/STRING [EXPECTGEN]
 //	xorctl -root DIR get    KEY
+//	xorctl -root DIR delete KEY EXPECTGEN
 //	xorctl -root DIR repair KEY
 //	xorctl -root DIR doctor       # run one background-repair pass
+//
+// delete returns the post-delete generation; recreate the same key with
+// "put KEY CONTENT <that generation>". A first write refuses to reuse an
+// old generation when unreferenced shards of an erased object remain
+// (reopen once to let recovery collect them).
 //
 // The root directory holds disk0/disk1/disk2. Disks may be corrupted by
 // hand between invocations to observe read repair:
